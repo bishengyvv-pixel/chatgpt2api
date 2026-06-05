@@ -54,6 +54,7 @@ sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
+session_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
 
@@ -221,10 +222,27 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
 
 
 def create_session(proxy: str = "") -> Any:
-    kwargs = {"impersonate": "edge101", "verify": True}
-    if proxy:
-        kwargs["proxy"] = proxy
-    return requests.Session(**kwargs)
+    """创建 curl_cffi session，加锁防止多线程并发初始化 TLS 引擎导致 curl(35) 错误。"""
+    with session_lock:
+        for attempt in range(3):
+            kwargs = {"impersonate": "chrome", "verify": True}
+            if proxy:
+                kwargs["proxy"] = proxy
+            session = requests.Session(**kwargs)
+            # TLS 探测：发一个轻量请求验证 impersonate 引擎初始化正常
+            try:
+                resp = session.get(
+                    "https://chatgpt.com/api/auth/csrf",
+                    headers={"user-agent": user_agent},
+                    timeout=10,
+                )
+                resp.close()
+                return session
+            except Exception:
+                session.close()
+                if attempt < 2:
+                    time.sleep(0.5)
+        raise RuntimeError("session TLS 初始化失败，已重试 3 次")
 
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
@@ -243,11 +261,11 @@ def validate_otp(session: requests.Session, device_id: str, code: str):
     headers["referer"] = f"{auth_base}/email-verification"
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
-    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
+    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers)
     if resp is not None and resp.status_code == 200:
         return resp, ""
     headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")
-    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
+    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers)
     return resp, error
 
 
@@ -293,7 +311,6 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
             "code": code,
             "redirect_uri": platform_oauth_redirect_uri,
         },
-        verify=False,
         timeout=60,
     )
     if resp.status_code != 200:
@@ -369,7 +386,7 @@ class PlatformRegistrar:
         req_headers = self._navigate_headers(f"{platform_base}/")
         if sentinel_token:
             req_headers["openai-sentinel-token"] = sentinel_token
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True, verify=False)
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True)
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
@@ -379,7 +396,7 @@ class PlatformRegistrar:
                 time.sleep(3)
                 retry_sentinel = _fetch_sentinel()
                 req_headers["openai-sentinel-token"] = retry_sentinel or sentinel_token
-                resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True, verify=False)
+                resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True)
                 if resp is None or resp.status_code != 200:
                     if _is_cloudflare_challenge(resp):
                         raise RuntimeError(f"被 Cloudflare 拦截{(' (出口IP: ' + self.outbound_ip + ')') if self.outbound_ip else ''}，请更换 IP 重试")
@@ -395,7 +412,7 @@ class PlatformRegistrar:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
+        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
@@ -406,7 +423,7 @@ class PlatformRegistrar:
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True)
         if resp is None or resp.status_code not in (200, 302):
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "发送验证码完成")
@@ -427,7 +444,7 @@ class PlatformRegistrar:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
+        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
