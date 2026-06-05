@@ -221,7 +221,7 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
 
 
 def create_session(proxy: str = "") -> Any:
-    kwargs = {"impersonate": "chrome", "verify": False}
+    kwargs = {"impersonate": "edge101", "verify": True}
     if proxy:
         kwargs["proxy"] = proxy
     return requests.Session(**kwargs)
@@ -308,6 +308,14 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.outbound_ip = ""
+        # 获取出口 IP（失败不阻塞注册流程）
+        try:
+            resp = self.session.get("https://api.ipify.org", timeout=5, verify=True)
+            if resp.status_code == 200:
+                self.outbound_ip = resp.text.strip()
+        except Exception:
+            pass
 
     def close(self) -> None:
         self.session.close()
@@ -330,6 +338,16 @@ class PlatformRegistrar:
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
         self.code_verifier, code_challenge = _generate_pkce()
+
+        # 预先获取 sentinel token，降低 CF 风控概率
+        def _fetch_sentinel() -> str:
+            try:
+                return build_sentinel_token(self.session, self.device_id, "authorize")
+            except Exception:
+                return ""
+
+        sentinel_token = _fetch_sentinel()
+
         params = {
             "issuer": auth_base,
             "client_id": platform_oauth_client_id,
@@ -348,12 +366,26 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        req_headers = self._navigate_headers(f"{platform_base}/")
+        if sentinel_token:
+            req_headers["openai-sentinel-token"] = sentinel_token
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True, verify=False)
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
+                # CF 拦截后冷却 3s，重新获取 sentinel token 再试一次
+                step(index, "检测到 CF 拦截，冷却后重试")
+                time.sleep(3)
+                retry_sentinel = _fetch_sentinel()
+                req_headers["openai-sentinel-token"] = retry_sentinel or sentinel_token
+                resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True, verify=False)
+                if resp is None or resp.status_code != 200:
+                    if _is_cloudflare_challenge(resp):
+                        raise RuntimeError(f"被 Cloudflare 拦截{(' (出口IP: ' + self.outbound_ip + ')') if self.outbound_ip else ''}，请更换 IP 重试")
+                    raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}")
+                step(index, "CF 重试成功")
+                return
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
@@ -452,6 +484,8 @@ def worker(index: int) -> dict:
     registrar = PlatformRegistrar(config["proxy"])
     try:
         step(index, "任务启动")
+        if registrar.outbound_ip:
+            step(index, f"出口IP: {registrar.outbound_ip}")
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])
