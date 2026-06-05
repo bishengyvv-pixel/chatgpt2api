@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import base64
 import hashlib
 import json
@@ -57,6 +58,62 @@ stats_lock = threading.Lock()
 session_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
+
+
+class ProxyPool:
+    """代理池：支持多代理轮询 + CF 拦截冷却。
+
+    config["proxy"] 支持以下格式：
+    - 单代理：socks5://1.2.3.4:1080
+    - 多代理（换行或逗号分隔）：
+        socks5://1.2.3.4:1080
+        http://5.6.7.8:3128
+        socks5://9.10.11.12:1080,socks5://13.14.15.16:1080
+    """
+    _DEFAULT_COOLDOWN_SECS = 300  # CF 拦截后冷却 5 分钟
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._index = 0
+        self._cooldown: dict[str, float] = {}  # proxy url -> cooldown deadline (time.time())
+
+    def _parse(self, raw: str) -> list[str]:
+        if not raw or not raw.strip():
+            return []
+        return [p.strip() for p in re.split(r"[\n,]+", raw) if p.strip()]
+
+    def _clean_expired_cooldowns(self) -> None:
+        now = time.time()
+        self._cooldown = {k: v for k, v in self._cooldown.items() if v > now}
+
+    def get(self) -> str:
+        """获取下一个可用代理。"""
+        proxies = self._parse(str(config.get("proxy") or ""))
+        if not proxies:
+            return ""
+        with self._lock:
+            self._clean_expired_cooldowns()
+            # 按冷却剩余时间排序，优先选不在冷却中的
+            available = [p for p in proxies if p not in self._cooldown]
+            if available:
+                self._index = (self._index + 1) % len(available)
+                return available[self._index]
+            # 所有代理都在冷却中，选冷却剩余时间最短的
+            best = min(proxies, key=lambda p: self._cooldown.get(p, 0))
+            return best
+
+    def mark_cooldown(self, proxy: str, cooldown_secs: int | None = None) -> None:
+        """CF 拦截后标记代理进入冷却。"""
+        if not proxy:
+            return
+        with self._lock:
+            self._cooldown[proxy] = time.time() + (cooldown_secs or self._DEFAULT_COOLDOWN_SECS)
+
+    def active_count(self) -> int:
+        return len(self._parse(str(config.get("proxy") or "")))
+
+
+proxy_pool = ProxyPool()
 
 common_headers = {
     "accept": "application/json",
@@ -321,6 +378,7 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
 
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
+        self._proxy = proxy
         self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
@@ -498,7 +556,7 @@ class PlatformRegistrar:
 
 def worker(index: int) -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+    registrar = PlatformRegistrar(proxy_pool.get())
     try:
         step(index, "任务启动")
         if registrar.outbound_ip:
@@ -521,7 +579,11 @@ def worker(index: int) -> dict:
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
-        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
+        msg = f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}"
+        if "Cloudflare" in str(e) and registrar._proxy:
+            proxy_pool.mark_cooldown(registrar._proxy)
+            msg += f"，代理 {registrar._proxy} 已进入冷却"
+        log(msg, "red")
         return {"ok": False, "index": index, "error": str(e)}
     finally:
         registrar.close()

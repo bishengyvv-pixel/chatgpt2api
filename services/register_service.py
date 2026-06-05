@@ -165,7 +165,8 @@ class RegisterService:
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
-        with ThreadPoolExecutor(max_workers=threads) as executor:
+        executor = ThreadPoolExecutor(max_workers=threads)
+        try:
             futures = set()
             while True:
                 cfg = self.get()
@@ -173,12 +174,15 @@ class RegisterService:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
+                enabled = self.get()["enabled"]
+                if not enabled:
                     break
-                if not futures:
+                if not futures and str(cfg.get("mode") or "total") == "total":
+                    break
+                if not futures and enabled:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                finished, futures = wait(futures, timeout=5, return_when=FIRST_COMPLETED)
                 for future in finished:
                     done += 1
                     try:
@@ -187,6 +191,8 @@ class RegisterService:
                         fail += 0 if result.get("ok") else 1
                     except Exception:
                         fail += 1
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             self._config["enabled"] = False

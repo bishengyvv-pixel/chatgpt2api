@@ -101,7 +101,51 @@ export function RegisterCard() {
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+              {(() => {
+                const raw = (config.proxy || "").split("\n");
+                const proxies = raw.length === 0 ? [""] : raw;
+                return (
+                  <div className="space-y-2">
+                    {proxies.map((proxy, idx) => (
+                      <div key={idx} className="flex gap-2">
+                        <Input
+                          value={proxy}
+                          onChange={(e) => {
+                            const updated = [...raw];
+                            updated[idx] = e.target.value;
+                            setProxy(updated.join("\n"));
+                          }}
+                          placeholder="socks5://1.2.3.4:1080"
+                          className="h-10 rounded-xl border-stone-200 bg-white font-mono text-xs"
+                          disabled={config.enabled}
+                        />
+                        {proxies.length > 1 && (
+                          <Button
+                            variant="outline"
+                            className="h-10 w-10 shrink-0 rounded-xl border-stone-200 bg-white p-0"
+                            onClick={() => {
+                              const updated = [...raw];
+                              updated.splice(idx, 1);
+                              setProxy(updated.join("\n"));
+                            }}
+                            disabled={config.enabled}
+                          >
+                            <Trash2 className="size-4" />
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                    <Button
+                      variant="outline"
+                      className="h-10 w-full rounded-xl border-dashed border-stone-300 bg-white text-xs text-stone-500"
+                      onClick={() => setProxy((config.proxy || "") + "\n")}
+                      disabled={config.enabled}
+                    >
+                      <Plus className="size-4" /> 添加代理
+                    </Button>
+                  </div>
+                );
+              })()}
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">目标剩余额度</label>
