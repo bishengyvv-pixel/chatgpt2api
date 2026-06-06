@@ -99,7 +99,8 @@ function ImageManagerContent() {
 
   const lightboxImages = filteredItems.map((item) => ({
     id: item.name,
-    src: item.url,
+    src: item.thumbnail_url || item.url,
+    originalSrc: item.url,
     sizeLabel: formatSize(item.size),
     dimensions: item.width && item.height ? `${item.width} x ${item.height}` : undefined,
   }));
@@ -489,6 +490,7 @@ function ImageManagerContent() {
                     <img
                       src={item.thumbnail_url || item.url}
                       alt={item.name}
+                      loading="lazy"
                       className="h-full w-full object-cover transition group-hover:scale-[1.02]"
                       onError={(event) => {
                         if (event.currentTarget.src !== item.url) {

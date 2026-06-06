@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 type LightboxImage = {
   id: string;
   src: string;
+  originalSrc?: string;
   sizeLabel?: string;
   dimensions?: string;
 };
@@ -185,7 +186,7 @@ export function ImageLightbox({
   const handleDownload = useCallback(() => {
     if (!current) return;
     const link = document.createElement("a");
-    link.href = current.src;
+    link.href = current.originalSrc || current.src;
     link.download = `image-${current.id}.png`;
     link.click();
   }, [current]);
