@@ -441,9 +441,8 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
+        # 首次请求不带 sentinel token（navigate 请求模拟浏览器行为）
         req_headers = self._navigate_headers(f"{platform_base}/")
-        if sentinel_token:
-            req_headers["openai-sentinel-token"] = sentinel_token
         resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True)
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
