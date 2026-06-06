@@ -450,14 +450,23 @@ class PlatformRegistrar:
             if _is_cloudflare_challenge(resp):
                 # CF 拦截后冷却 3s，重新获取 sentinel token 再试一次
                 step(index, "检测到 CF 拦截，冷却后重试")
-                time.sleep(3)
+                time.sleep(5)
+                # 重新生成 OAuth 参数（第一次已被 OpenAI 后端处理，state 已消耗）
+                self.code_verifier, code_challenge = _generate_pkce()
+                params["state"] = secrets.token_urlsafe(32)
+                params["nonce"] = secrets.token_urlsafe(32)
+                params["code_challenge"] = code_challenge
                 retry_sentinel = _fetch_sentinel()
                 req_headers["openai-sentinel-token"] = retry_sentinel or sentinel_token
                 resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=req_headers, allow_redirects=True)
                 if resp is None or resp.status_code != 200:
                     if _is_cloudflare_challenge(resp):
-                        raise RuntimeError(f"被 Cloudflare 拦截{(' (出口IP: ' + self.outbound_ip + ')') if self.outbound_ip else ''}，请更换 IP 重试")
-                    raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}")
+                        # 两次都 CF 拦截 → 清理 session 后换代理
+                        self.session.cookies.clear()
+                        raise RuntimeError(f"两次被 Cloudflare 拦截{(' (出口IP: ' + self.outbound_ip + ')') if self.outbound_ip else ''}，请更换 IP 重试")
+                    debug = _response_debug_detail(resp)
+                    status = getattr(resp, "status_code", "unknown")
+                    raise RuntimeError(error or f"platform_authorize_retry_http_{status}, {debug}")
                 step(index, "CF 重试成功")
                 return
             debug = _response_debug_detail(resp)
