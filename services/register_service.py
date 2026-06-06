@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 import json
 import threading
 import time
 import uuid
+from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +96,10 @@ class RegisterService:
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
+            # 激活统计看板的猴子补丁（不修改 openai_register.py）
+            _reset_task_stats()
+            _patch_registrar()
+            _patch_worker()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
@@ -198,6 +204,170 @@ class RegisterService:
             self._config["enabled"] = False
             self._save()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
+
+
+# ── 统计看板（非侵入式，猴子补丁旁挂）────────────────────
+
+_task_stats_lock = threading.Lock()
+_step_records: list[dict] = []
+_task_records: list[dict] = []
+_proxy_stats: dict = defaultdict(lambda: {"success": 0, "fail": 0, "total": 0})
+_domain_stats: dict = defaultdict(lambda: {"success": 0, "fail": 0, "total": 0})
+
+
+def _record_step(step_name: str, ok: bool, duration: float, error: str = "") -> None:
+    with _task_stats_lock:
+        _step_records.append({"step": step_name, "ok": ok, "duration": round(duration, 2), "error": str(error)[:200]})
+
+
+def _record_task(
+    index: int, proxy: str, domain: str, email: str,
+    ok: bool, duration: float, error: str = "", failed_step: str = "",
+) -> None:
+    with _task_stats_lock:
+        task = {
+            "index": index, "status": "success" if ok else "fail",
+            "proxy": proxy, "domain": domain, "email": email,
+            "duration": round(duration, 2), "error": str(error)[:200],
+            "failed_step": failed_step, "time": _now(),
+        }
+        _task_records.append(task)
+        if len(_task_records) > 50:
+            _task_records.pop(0)
+        if proxy:
+            ps = _proxy_stats[proxy]
+            ps["total"] += 1
+            ps["success" if ok else "fail"] += 1
+        if domain:
+            ds = _domain_stats[domain]
+            ds["total"] += 1
+            ds["success" if ok else "fail"] += 1
+
+
+def get_task_stats() -> dict:
+    """返回聚合统计快照。"""
+    with _task_stats_lock:
+        step_agg: dict = defaultdict(lambda: {"success": 0, "fail": 0, "total": 0, "durations": []})
+        for r in _step_records:
+            s = step_agg[r["step"]]
+            s["success" if r["ok"] else "fail"] += 1
+            s["total"] += 1
+            s["durations"].append(r["duration"])
+        step_stats: dict = {}
+        for name, agg in step_agg.items():
+            step_stats[name] = {
+                "success": agg["success"], "fail": agg["fail"], "total": agg["total"],
+                "avg_duration": round(sum(agg["durations"]) / len(agg["durations"]), 2) if agg["durations"] else 0,
+            }
+        ps: dict = {}
+        try:
+            from services.register.openai_register import proxy_pool
+            _cooldowns = dict(proxy_pool._cooldown) if hasattr(proxy_pool, "_cooldown") else {}
+        except Exception:
+            _cooldowns = {}
+        for p, d in _proxy_stats.items():
+            ps[p] = dict(d)
+            ps[p]["cooldown"] = p in _cooldowns
+        ds: dict = {}
+        for d, v in _domain_stats.items():
+            ds[d] = dict(v)
+            ds[d]["blocked"] = v["fail"] >= 5 and v["success"] == 0
+        return {
+            "step_stats": step_stats,
+            "proxy_stats": ps,
+            "domain_stats": ds,
+            "recent_tasks": list(_task_records),
+            "totals": {
+                "success": sum(1 for r in _task_records if r["status"] == "success"),
+                "fail": sum(1 for r in _task_records if r["status"] == "fail"),
+                "total": len(_task_records),
+            },
+            "job_running": register_service._config.get("enabled", False),
+        }
+
+
+def _reset_task_stats() -> None:
+    with _task_stats_lock:
+        _step_records.clear()
+        _task_records.clear()
+        _proxy_stats.clear()
+        _domain_stats.clear()
+
+
+def _step_decorator(step_name: str):
+    """步骤级装饰器工厂"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            start = time.time()
+            try:
+                return func(self, *args, **kwargs)
+            except Exception as e:
+                _record_step(step_name, False, time.time() - start, str(e))
+                raise
+            _record_step(step_name, True, time.time() - start)
+        return wrapper
+    return decorator
+
+
+def _patch_registrar() -> None:
+    """运行时给 PlatformRegistrar 方法挂步骤统计装饰器（不修改源文件）。"""
+    from services.register.openai_register import PlatformRegistrar
+    for method_name in [
+        "_platform_authorize", "_register_user", "_send_otp",
+        "_create_account", "_exchange_registered_tokens",
+    ]:
+        if not hasattr(PlatformRegistrar, method_name):
+            continue
+        # 防止重复 patch
+        original = getattr(PlatformRegistrar, method_name)
+        if getattr(original, "_stats_patched", False):
+            continue
+        setattr(PlatformRegistrar, method_name, _step_decorator(method_name)(original))
+        getattr(PlatformRegistrar, method_name)._stats_patched = True
+
+
+def _patch_worker() -> None:
+    """运行时给 worker() 挂任务级统计包装（不修改源文件）。"""
+    import services.register.openai_register as reg
+    original_worker = reg.worker
+    if getattr(original_worker, "_stats_patched", False):
+        return
+
+    @functools.wraps(original_worker)
+    def _tracked_worker(index: int) -> dict:
+        task_start = time.time()
+        result = original_worker(index)
+        ok = bool(result.get("ok"))
+        email = ""
+        domain = ""
+        proxy = ""
+        error = str(result.get("error") or "")
+        failed_step = ""
+
+        if ok and isinstance(result.get("result"), dict):
+            email = str(result["result"].get("email") or "")
+            domain = email.split("@")[-1] if "@" in email else ""
+        elif not ok:
+            if "Cloudflare" in error:
+                failed_step = "_platform_authorize"
+            elif "user_register" in error or "409" in error or "403" in error:
+                failed_step = "_register_user"
+            elif "send_otp" in error:
+                failed_step = "_send_otp"
+            elif "create_account" in error:
+                failed_step = "_create_account"
+            elif "token" in error.lower():
+                failed_step = "_exchange_registered_tokens"
+
+        _record_task(index, proxy, domain, email, ok, time.time() - task_start, error, failed_step)
+        return result
+
+    _tracked_worker._stats_patched = True
+    reg.worker = _tracked_worker
+
+
+# ── 统计看板结束 ──────────────────────────────────────────
 
 
 register_service = RegisterService(REGISTER_FILE)

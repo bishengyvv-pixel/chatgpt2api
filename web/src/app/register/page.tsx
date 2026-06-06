@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { LoaderCircle } from "lucide-react";
+import { BarChart3, LoaderCircle } from "lucide-react";
+import Link from "next/link";
 
+import { Button } from "@/components/ui/button";
 import webConfig from "@/constants/common-env";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import type { RegisterConfig } from "@/lib/api";
@@ -46,6 +48,14 @@ function RegisterPageContent() {
   return (
     <>
       <RegisterDataController />
+      <div className="mb-4 flex items-center justify-end">
+        <Link href="/register/stats">
+          <Button variant="outline" size="sm" className="gap-1.5 rounded-xl border-stone-200 bg-white">
+            <BarChart3 className="size-4" />
+            统计看板
+          </Button>
+        </Link>
+      </div>
       <section className="mb-2 flex flex-col gap-1 lg:flex-row lg:items-start lg:justify-between">
         <div className="space-y-1">
           <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Register</div>

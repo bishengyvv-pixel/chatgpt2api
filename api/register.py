@@ -50,6 +50,12 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return {"register": register_service.reset()}
 
+    @router.get("/api/register/stats")
+    async def get_register_stats(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        from services.register_service import get_task_stats
+        return {"stats": get_task_stats()}
+
     @router.get("/api/register/events")
     async def register_events(token: str = ""):
         require_admin(f"Bearer {token}")
